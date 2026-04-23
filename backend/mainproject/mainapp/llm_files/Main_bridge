@@ -1,0 +1,890 @@
+from flask import Flask, request, jsonify
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+import json
+import time
+import re
+import logging
+import gc
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# -------------------------------------------------------------
+# ✅ Memory Management Functions
+# -------------------------------------------------------------
+def cleanup_memory():
+    """Force cleanup of GPU and CPU memory"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    logger.info("🧹 Memory cleanup completed")
+
+def safe_tensor_delete(tensors):
+    """Safely delete tensors and free memory"""
+    for name, tensor in list(tensors.items()):
+        if tensor is not None:
+            del tensor
+    cleanup_memory()
+
+# -------------------------------------------------------------
+# ✅ Load model (optimized for RTX 4050 - 8GB VRAM)
+# -------------------------------------------------------------
+MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.2"
+
+print("🚀 Loading Mistral model for RTX 4050... Please wait...")
+
+try:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+    # Add padding token if it doesn't exist
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Optimized model loading with memory management
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        low_cpu_mem_usage=True,
+        trust_remote_code=True
+    )
+
+    # Set model to evaluation mode
+    model.eval()
+    
+    device = next(model.parameters()).device
+    print(f"✅ Mistral model loaded successfully on: {device}")
+
+except Exception as e:
+    print(f"❌ Error loading model: {e}")
+    model, tokenizer = None, None
+
+def extract_operations_from_response(response_text):
+    """Extract preprocessing operations from AI response - FAST VERSION"""
+    print("🔍 Extracting operations from AI response...")
+
+    # FAST METHOD: Direct JSON parsing only
+    json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+    if json_match:
+        try:
+            json_str = json_match.group()
+            # Clean the JSON string
+            json_str = re.sub(r'[\n\t]', ' ', json_str)
+            operations = json.loads(json_str)
+            if isinstance(operations, list) and len(operations) > 0:
+                print(f"✅ Found JSON operations: {operations}")
+                return operations
+        except json.JSONDecodeError as e:
+            print(f"❌ JSON parsing failed: {e}")
+
+    # NO PATTERN MATCHING - Return empty for speed
+    print("❌ No valid JSON operations found")
+    return []
+
+def extract_column_operations_from_response(response_text):
+    """Extract column-wise operations - FAST VERSION"""
+    print("🔍 Extracting column-wise operations...")
+
+    try:
+        # Look for JSON object only
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            json_str = json_match.group()
+            json_str = re.sub(r'[\n\t]', ' ', json_str)
+            operations_dict = json.loads(json_str)
+
+            if isinstance(operations_dict, dict) and len(operations_dict) > 0:
+                print(f"✅ Found column-wise operations")
+                return operations_dict
+    except json.JSONDecodeError as e:
+        print(f"❌ JSON parsing failed: {e}")
+
+    return {}
+
+# -------------------------------------------------------------
+# ✅ Enhanced Prompt Engineering for Data Analyst Operations
+# -------------------------------------------------------------
+
+def _create_expert_prompt(summary, analysis_type):
+    """Create expert-level prompts for different analysis modes"""
+    
+    if analysis_type == "fast":
+        return f"""<s>[INST] You are a senior data analyst in a regulated production environment. Analyze this dataset summary with strict conservative principles:
+
+**Dataset Summary:**
+{summary}
+
+**DATA ANALYST OPERATION CATALOG - ALL BASIC OPERATIONS:**
+
+A. VALIDATION OPERATIONS (ALWAYS SAFE - NO DATA MODIFICATION):
+1. validate:datatypes - Verify column data types match content
+2. validate:integrity - Check for logical inconsistencies
+3. validate:uniqueness - Verify unique constraints
+4. validate:ranges - Check value ranges are reasonable
+5. validate:formats - Validate date/time/string formats
+6. validate:relationships - Check foreign key relationships
+7. annotate:metadata - Add column descriptions and tags
+8. flag:constraints - Flag potential constraint violations
+
+B. DATA CLEANSING OPERATIONS (LOW RISK):
+9. remove:duplicates_exact - Remove exact row duplicates
+10. remove:duplicates_fuzzy - Remove fuzzy duplicates (similarity >90%)
+11. remove:null_rows - Remove rows with all null values
+12. remove:null_columns - Remove columns with all null values
+13. correct:formats - Fix formatting issues (dates, strings)
+14. standardize:casing - Standardize text casing
+15. trim:whitespace - Trim leading/trailing whitespace
+16. parse:datetimes - Parse datetime strings to proper format
+17. normalize:text - Normalize text (remove accents, special chars)
+
+C. MISSING DATA HANDLING (MEDIUM RISK - PRESERVE ORIGINAL):
+18. impute:mean - For normally distributed continuous
+19. impute:median - For skewed continuous
+20. impute:mode - For categorical
+21. impute:constant - With specified constant value
+22. impute:forward_fill - Time-series forward fill
+23. impute:backward_fill - Time-series backward fill
+24. impute:interpolate - Linear interpolation
+25. flag:missing - Create missingness indicator columns
+26. preserve:missing - Keep missing values as-is with annotation
+
+D. TRANSFORMATION OPERATIONS (HIGH RISK - CREATE NEW COLUMNS):
+27. encode:onehot - One-hot encoding (<10 categories)
+28. encode:label - Label encoding for ordinal categories
+29. encode:binary - Convert to binary (0/1)
+30. scale:standard - Standard scaling (mean=0, std=1)
+31. scale:minmax - Min-max scaling (range 0-1)
+32. scale:robust - Robust scaling (median/IQR based)
+33. transform:log - Log transformation for right skew
+34. transform:sqrt - Square root transformation
+35. transform:boxcox - Box-Cox transformation
+36. transform:yeojohnson - Yeo-Johnson transformation
+37. binning:equal_width - Equal width binning
+38. binning:equal_freq - Equal frequency binning
+39. discretize:quantiles - Discretize by quantiles
+40. extract:datetime - Extract date/time components
+41. extract:text - Extract text features (length, word count)
+42. combine:features - Create interaction features
+
+E. OUTLIER HANDLING (HIGH RISK - FLAG, DON'T REMOVE):
+43. detect:outliers_iqr - IQR method detection
+44. detect:outliers_zscore - Z-score method (|z|>3)
+45. detect:outliers_mad - MAD method
+46. detect:outliers_isolation - Isolation forest detection
+47. flag:outliers - Flag outliers without removal
+48. winsorize:limits - Winsorize extreme values (keep but cap)
+49. analyze:outliers - Analyze outlier patterns only
+
+F. FEATURE ENGINEERING (CONTEXT DEPENDENT):
+50. create:aggregates - Create aggregated features
+51. create:ratios - Create ratio features
+52. create:differentials - Create difference features
+53. create:rolling_stats - Rolling statistics
+54. create:lag_features - Lag features for time series
+55. create:lead_features - Lead features for time series
+56. create:polynomial - Polynomial features
+57. create:interactions - Interaction terms
+
+G. DIMENSIONALITY REDUCTION (SPECIALIZED):
+58. reduce:pca - Principal Component Analysis
+59. reduce:tsne - t-SNE for visualization
+60. reduce:umap - UMAP for visualization
+61. select:correlation - Remove highly correlated features
+62. select:variance - Remove low variance features
+63. select:model_based - Model-based feature selection
+
+**DECISION FRAMEWORK - DATA ANALYST RULES:**
+1. Always start with validation operations (Group A)
+2. Only proceed to cleansing if validation reveals issues
+3. For missing data: Flag first, impute only if <30% missing and mechanism understood
+4. Transformations: Always create new columns, never overwrite
+5. Outliers: Never remove, only flag or analyze
+6. Feature engineering: Only if domain knowledge supports it
+7. Skip encoding for: ID columns, free text, high cardinality (>100)
+8. Skip scaling for: tree-based models, ID columns, already scaled data
+9. Skip transformations for: binary variables, already normalized data
+10. When in doubt: Choose safer operation or skip
+
+**COLUMN INTENT DETECTION:**
+- ID columns: validate:datatypes only
+- Target columns: skip all preprocessing
+- Datetime: validate:formats + extract:datetime components
+- Categorical low (<10): encode:onehot
+- Categorical medium (10-50): encode:label
+- Categorical high (>50): skip encoding, use target encoding if supervised
+- Numerical continuous: validate:ranges + flag:outliers
+- Numerical discrete (<20 unique): treat as categorical
+- Text columns: trim:whitespace + standardize:casing only
+
+**Output Format:** JSON array with EXACTLY 3 prioritized operations OR ["skip"] if risky.
+Prioritize: Validation > Cleansing > Missing handling > Transformations
+
+Example: ["validate:datatypes", "annotate:metadata", "flag:missing"]
+
+Respond ONLY with JSON array, no explanations. [/INST]"""
+
+    elif analysis_type == "basic":
+        return f"""<s>[INST] You are a principal data analyst. Analyze dataset with comprehensive but safe preprocessing:
+
+**Dataset Summary:**
+{summary}
+
+**OPERATION PRIORITIZATION GUIDE:**
+
+TIER 1: SAFETY & VALIDATION (ALWAYS APPLICABLE):
+- validate:datatypes (verify all column types)
+- annotate:metadata (document column purposes)
+- validate:integrity (check business rules)
+- flag:missing (create missing indicators)
+
+TIER 2: DATA CLEANSING (APPLY IF NEEDED):
+- remove:duplicates_exact (exact matches only)
+- standardize:casing (text consistency)
+- trim:whitespace (clean whitespace)
+- parse:datetimes (fix date formats)
+- correct:formats (standardize formats)
+
+TIER 3: MISSING DATA (CAUTIOUS APPROACH):
+- If <5% missing: impute based on distribution
+- If 5-30% missing: flag:missing + optional imputation
+- If >30% missing: preserve:missing (no imputation)
+- Never impute: IDs, primary keys, targets
+
+TIER 4: TRANSFORMATIONS (CREATE NEW COLUMNS):
+- encode:onehot for low-cardinality categorical (<10)
+- encode:label for ordinal or tree models
+- scale:standard for distance-based algorithms
+- scale:robust for outlier-prone data
+- transform:log for exponential distributions
+
+TIER 5: OUTLIER MANAGEMENT (FLAG ONLY):
+- detect:outliers_iqr (IQR method)
+- flag:outliers (add outlier indicators)
+- winsorize:limits for extreme winsorizing
+- NEVER remove outliers automatically
+
+TIER 6: FEATURE ENGINEERING (DOMAIN KNOWLEDGE):
+- extract:datetime from date columns
+- create:ratios for related metrics
+- create:aggregates for grouped data
+- Only if clearly beneficial
+
+**RISK ASSESSMENT CHECKLIST:**
+✓ Will operation lose information? (If yes, skip)
+✓ Will operation create data leakage? (If yes, skip)
+✓ Will operation assume distributions? (If yes, use robust methods)
+✓ Is operation reversible? (If no, create new column)
+✓ Is there domain justification? (If no, skip)
+
+**Output:** JSON array of prioritized operations OR ["skip"] if preprocessing risks exceed benefits.
+
+Example: ["validate:datatypes", "annotate:metadata", "remove:duplicates_exact", "flag:missing", "encode:onehot"]
+
+ONLY JSON, no text. [/INST]"""
+
+    elif analysis_type == "column_wise":
+        return f"""<s>[INST] You are a data platform architect. Perform column-wise analysis with full operation catalog:
+
+**Dataset Summary:**
+{summary}
+
+**COLUMN-SPECIFIC DECISION MATRIX:**
+
+1. **ID / KEY COLUMNS:**
+   - Operations: ["validate:datatypes", "validate:uniqueness"]
+   - Prohibited: ANY encoding, scaling, transformation
+   - Note: Primary keys must remain unchanged
+
+2. **TARGET / LABEL COLUMNS:**
+   - Operations: ["skip"]
+   - Prohibited: ALL preprocessing except validation
+   - Exception: Binary classification may need ["validate:ranges"]
+
+3. **DATETIME COLUMNS:**
+   - Operations: ["validate:formats", "parse:datetimes", "extract:datetime"]
+   - Extract: year, month, day, hour, weekday, quarter
+   - Prohibited: scaling, encoding
+
+4. **CATEGORICAL COLUMNS - ANALYSIS:**
+   - Cardinality <10: ["validate:datatypes", "impute:mode", "encode:onehot"]
+   - Cardinality 10-50: ["validate:datatypes", "impute:mode", "encode:label"]
+   - Cardinality 50-100: ["validate:datatypes", "annotate:high_cardinality"]
+   - Cardinality >100: ["validate:datatypes", "skip"] - consider target encoding later
+   - Ordinal: Use encode:label NOT encode:onehot
+   - Binary: Use encode:binary
+
+5. **NUMERICAL CONTINUOUS - ANALYSIS:**
+   - Normal distribution: ["validate:ranges", "impute:mean", "scale:standard"]
+   - Skewed distribution: ["validate:ranges", "impute:median", "scale:robust"]
+   - Unknown distribution: ["validate:ranges", "impute:median", "scale:robust"]
+   - With outliers: ["detect:outliers_iqr", "flag:outliers", "scale:robust"]
+   - Bounded (0-1 or 0-100): ["validate:ranges", "impute:median"] - no scaling needed
+
+6. **NUMERICAL DISCRETE (<20 unique values):**
+   - Treat as categorical: ["validate:datatypes", "encode:onehot" if <10 else "encode:label"]
+   - If counts: ["validate:ranges", "impute:median"] - preserve count nature
+
+7. **TEXT / STRING COLUMNS:**
+   - Short text: ["trim:whitespace", "standardize:casing"]
+   - Free text: ["trim:whitespace"] only - no further processing
+   - Structured text: ["extract:text"] for features like length
+
+8. **BOOLEAN COLUMNS:**
+   - Operations: ["validate:datatypes", "encode:binary"]
+   - Ensure proper true/false representation
+
+**MISSINGNESS STRATEGY BY COLUMN TYPE:**
+- IDs: No imputation, flag if missing
+- Targets: No imputation
+- Categorical: impute:mode or new "MISSING" category
+- Numerical: impute:median (robust) or mean (if normal)
+- Datetime: impute:forward_fill for time series, else flag
+
+**OUTLIER STRATEGY:**
+- Financial amounts: winsorize:limits (99th percentile)
+- Physical measurements: flag:outliers (may be valid extremes)
+- Counts: analyze:outliers only (may be valid)
+- Percentages: validate:ranges (0-100%) - outliers unlikely
+
+**DATASET-WIDE OPERATIONS:**
+- validate:integrity (cross-column checks)
+- remove:duplicates_exact (global deduplication)
+- validate:relationships (foreign key checks)
+- annotate:metadata (dataset-level documentation)
+
+**Output Format:** JSON object with column names as keys and array of operations as values.
+Include "dataset_wide" key for global operations.
+
+Example:
+{{
+  "CustomerID": ["validate:datatypes", "validate:uniqueness"],
+  "TransactionDate": ["validate:formats", "parse:datetimes", "extract:datetime"],
+  "ProductCategory": ["validate:datatypes", "impute:mode", "encode:onehot"],
+  "Amount": ["validate:ranges", "impute:median", "detect:outliers_iqr", "scale:robust"],
+  "dataset_wide": ["validate:integrity", "remove:duplicates_exact", "annotate:metadata"]
+}}
+
+ONLY JSON, no explanations. [/INST]"""
+
+    # Default prompt for unexpected analysis_type
+    return f"""<s>[INST] Analyze dataset with comprehensive data analyst operations. Respond with JSON array only. [/INST]"""
+
+# -------------------------------------------------------------
+# ✅ Health check
+# -------------------------------------------------------------
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "model_loaded": model is not None,
+        "service": "Mistral AI Preprocessing Advisor",
+        "device": str(next(model.parameters()).device) if model else "unknown",
+        "memory_optimized": True,
+        "operation_catalog": "full_data_analyst_ops"
+    }), 200
+
+# -------------------------------------------------------------
+# ✅ Enhanced Validation Functions
+# -------------------------------------------------------------
+
+def _validate_expert_operations(operations, analysis_type):
+    """Ensure operations meet expert safety standards"""
+    if not isinstance(operations, list):
+        return ["validate:datatypes"]  # Default safe operation
+    
+    # If AI recommends skip, respect it
+    if operations == ["skip"]:
+        return ["skip"]
+    
+    validated_ops = []
+    
+    # Always start with validation operations if not present
+    validation_ops = ["validate:datatypes", "annotate:metadata", "validate:integrity"]
+    has_validation = False
+    for op in operations:
+        if op in validation_ops:
+            has_validation = True
+            break
+    
+    if not has_validation:
+        validated_ops.append("validate:datatypes")
+    
+    # Categorize operations by risk level
+    safe_operations = {
+        # Validation
+        "validate:datatypes", "validate:integrity", "validate:uniqueness",
+        "validate:ranges", "validate:formats", "validate:relationships",
+        "annotate:metadata", "flag:constraints",
+        
+        # Basic cleansing
+        "trim:whitespace", "standardize:casing", "parse:datetimes",
+        "correct:formats", "normalize:text",
+        
+        # Flagging
+        "flag:missing", "flag:outliers",
+        
+        # Analysis only
+        "analyze:outliers", "preserve:missing"
+    }
+    
+    medium_risk_operations = {
+        # Deduplication
+        "remove:duplicates_exact", "remove:duplicates_fuzzy",
+        
+        # Null handling
+        "remove:null_rows", "remove:null_columns",
+        
+        # Basic imputation
+        "impute:mode", "impute:constant",
+        
+        # Basic encoding
+        "encode:label", "encode:binary",
+        
+        # Safe transformations
+        "extract:datetime", "extract:text",
+        
+        # Outlier detection (not removal)
+        "detect:outliers_iqr", "detect:outliers_zscore",
+        "detect:outliers_mad", "detect:outliers_isolation"
+    }
+    
+    high_risk_operations = {
+        # Advanced imputation
+        "impute:mean", "impute:median", "impute:forward_fill",
+        "impute:backward_fill", "impute:interpolate",
+        
+        # Transformations
+        "encode:onehot", "scale:standard", "scale:minmax",
+        "scale:robust", "transform:log", "transform:sqrt",
+        "transform:boxcox", "transform:yeojohnson",
+        "binning:equal_width", "binning:equal_freq",
+        "discretize:quantiles", "combine:features",
+        
+        # Feature engineering
+        "create:aggregates", "create:ratios", "create:differentials",
+        "create:rolling_stats", "create:lag_features",
+        "create:lead_features", "create:polynomial",
+        "create:interactions",
+        
+        # Dimensionality reduction
+        "reduce:pca", "reduce:tsne", "reduce:umap",
+        "select:correlation", "select:variance", "select:model_based",
+        
+        # Outlier modification
+        "winsorize:limits"
+    }
+    
+    # Operation limits based on analysis type
+    if analysis_type == "fast":
+        # Fast mode: 1 safe + 1 medium + 1 high risk max
+        safe_count = 0
+        medium_count = 0
+        high_count = 0
+        
+        for op in operations:
+            if op in safe_operations and safe_count < 1:
+                validated_ops.append(op)
+                safe_count += 1
+            elif op in medium_risk_operations and medium_count < 1:
+                validated_ops.append(op)
+                medium_count += 1
+            elif op in high_risk_operations and high_count < 1:
+                validated_ops.append(op)
+                high_count += 1
+            elif len(validated_ops) >= 3:
+                break
+                
+    else:  # basic mode
+        # Basic mode: more flexible but controlled
+        safe_count = 0
+        medium_count = 0
+        high_count = 0
+        
+        for op in operations:
+            if op in safe_operations and safe_count < 3:
+                validated_ops.append(op)
+                safe_count += 1
+            elif op in medium_risk_operations and medium_count < 2:
+                validated_ops.append(op)
+                medium_count += 1
+            elif op in high_risk_operations and high_count < 1:
+                validated_ops.append(op)
+                high_count += 1
+    
+    # Ensure we have at least one operation unless skip
+    if not validated_ops and operations != ["skip"]:
+        validated_ops = ["validate:datatypes"]
+    
+    # Limit total operations
+    max_ops = 3 if analysis_type == "fast" else 5
+    return validated_ops[:max_ops]
+
+def _validate_column_operations(column_ops):
+    """Validate column-wise operations for safety and appropriateness"""
+    if not isinstance(column_ops, dict):
+        return {"dataset_wide": ["validate:datatypes"]}
+    
+    validated_ops = {}
+    
+    # Process each column
+    for column, operations in column_ops.items():
+        if not isinstance(operations, list):
+            continue
+        
+        # Skip target-like columns entirely
+        target_keywords = ['target', 'label', 'y_', 'class', 'outcome', 
+                          'response', 'dependent', 'predicted']
+        if any(keyword in column.lower() for keyword in target_keywords):
+            validated_ops[column] = ["skip"]
+            continue
+        
+        # ID-like columns: minimal validation only
+        id_keywords = ['id', '_id', 'key', 'index', 'uuid', 'guid', 
+                      'primary', 'foreign', 'reference', 'code']
+        if any(keyword in column.lower() for keyword in id_keywords):
+            validated_ops[column] = ["validate:datatypes", "validate:uniqueness"]
+            continue
+        
+        # Datetime columns: format validation + extraction
+        datetime_keywords = ['date', 'time', 'datetime', 'timestamp', 
+                           'created', 'modified', 'updated', 'start', 'end']
+        if any(keyword in column.lower() for keyword in datetime_keywords):
+            validated_ops[column] = ["validate:formats", "parse:datetimes", "extract:datetime"]
+            continue
+        
+        # Text columns: basic cleaning only
+        text_keywords = ['name', 'description', 'title', 'note', 'comment',
+                        'address', 'city', 'country', 'state', 'text']
+        if any(keyword in column.lower() for keyword in text_keywords):
+            validated_ops[column] = ["trim:whitespace", "standardize:casing"]
+            continue
+        
+        # Boolean columns
+        bool_keywords = ['is_', 'has_', 'was_', 'were_', 'flag', 'status',
+                        'active', 'enabled', 'verified', 'completed']
+        if any(keyword in column.lower() for keyword in bool_keywords):
+            validated_ops[column] = ["validate:datatypes", "encode:binary"]
+            continue
+        
+        # Filter operations for safety based on column type inference
+        safe_col_ops = []
+        for op in operations:
+            # Check for prohibited operations
+            prohibited = ["remove:duplicates_fuzzy", "impute:forward_fill", 
+                         "impute:backward_fill", "transform:boxcox",
+                         "transform:yeojohnson", "reduce:pca", "reduce:tsne",
+                         "reduce:umap", "winsorize:limits"]
+            
+            if op not in prohibited:
+                if op not in safe_col_ops:  # Avoid duplicates
+                    safe_col_ops.append(op)
+        
+        # Default safe operations if none remain
+        if not safe_col_ops:
+            safe_col_ops = ["validate:datatypes"]
+        
+        validated_ops[column] = safe_col_ops
+    
+    # Ensure dataset_wide operations exist
+    if "dataset_wide" not in validated_ops:
+        validated_ops["dataset_wide"] = ["validate:datatypes", "annotate:metadata"]
+    
+    return validated_ops
+
+def _flatten_operations(column_operations):
+    """Flatten column operations"""
+    all_operations = []
+    for column, operations in column_operations.items():
+        all_operations.extend(operations)
+    return list(set(all_operations))
+
+# -------------------------------------------------------------
+# ✅ AI Analysis Route - OPTIMIZED FOR SPEED & MEMORY
+# -------------------------------------------------------------
+@app.route("/analyze", methods=["POST"])
+def analyze_dataset():
+    """Accept dataset summary and return AI preprocessing suggestions"""
+    if model is None:
+        return jsonify({"error": "Model not loaded properly"}), 500
+
+    start_time = time.time()
+
+    try:
+        # -----------------------------
+        # 📥 Get data from request
+        # -----------------------------
+        data = request.get_json(force=True)
+        summary = data.get("summary", "").strip()
+        analysis_type = data.get("analysis_type", "fast")  # DEFAULT TO FAST
+
+        if not summary:
+            return jsonify({"error": "Missing 'summary' field"}), 280
+
+        print("📥 Received dataset summary for analysis...")
+        print(f"Summary preview: {summary[:200]}...")
+        print(f"Analysis type: {analysis_type}")
+
+        if analysis_type == "column_wise":
+            result = _analyze_column_wise(summary, start_time)
+        elif analysis_type == "fast":
+            result = _analyze_fast(summary, start_time)
+        else:
+            result = _analyze_basic(summary, start_time)
+        
+        # Force memory cleanup after each request
+        cleanup_memory()
+        return result
+
+    except Exception as e:
+        logger.error(f"❌ Error in /analyze: {str(e)}")
+        cleanup_memory()  # Cleanup even on error
+        return jsonify({"success": False, "error": str(e)}), 500
+
+def _analyze_fast(summary, start_time):
+    """ULTRA-FAST analysis with senior data analyst reasoning"""
+    try:
+        # -----------------------------
+        # 🧠 ENHANCED: Expert FAST AI prompt
+        # -----------------------------
+        prompt = _create_expert_prompt(summary, "fast")
+        
+        # -----------------------------
+        # ⚙️ Generate with model - ULTRA FAST PARAMETERS
+        # -----------------------------
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(model.device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=80,  # Very short response
+                temperature=0.1,  # Lower temperature for deterministic output
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+                repetition_penalty=1.1,
+                num_return_sequences=1
+            )
+
+        # Extract response
+        generated_tokens = outputs[0][inputs['input_ids'].shape[1]:]
+        ai_response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+        print("✅ AI model responded with expert reasoning!")
+        print(f"🧠 Raw AI output: {ai_response}")
+        
+        # Extract operations
+        operations = extract_operations_from_response(ai_response)
+        elapsed = round(time.time() - start_time, 2)
+
+        # Validate operations meet expert criteria
+        operations = _validate_expert_operations(operations, "fast")
+        
+        # 🧹 CRITICAL: Clean up tensors immediately
+        safe_tensor_delete({'inputs': inputs, 'outputs': outputs, 'generated_tokens': generated_tokens})
+
+        print("=" * 50)
+        print("📊 EXPERT FAST ANALYSIS COMPLETED")
+        print(f"✅ VALIDATED OPERATIONS: {operations}")
+        print(f"⚡ Generation time: {elapsed} seconds\n")
+
+        return jsonify({
+            "success": True,
+            "generation_time": elapsed,
+            "steps": operations,
+            "ai_response_raw": ai_response[:200],
+            "model_used": MODEL_NAME,
+            "analysis_type": "fast",
+            "memory_managed": True,
+            "reasoning_level": "senior_data_analyst"
+        }), 200
+
+    except Exception as e:
+        cleanup_memory()
+        raise e
+
+def _analyze_basic(summary, start_time):
+    """Basic analysis with principal data analyst reasoning"""
+    try:
+        prompt = _create_expert_prompt(summary, "basic")
+        
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1536).to(model.device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=120,
+                temperature=0.2,  # Slightly higher than fast but still deterministic
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+                repetition_penalty=1.1,
+                num_return_sequences=1
+            )
+
+        generated_tokens = outputs[0][inputs['input_ids'].shape[1]:]
+        ai_response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+        print("✅ AI model responded with principal-level reasoning!")
+        operations = extract_operations_from_response(ai_response)
+        elapsed = round(time.time() - start_time, 2)
+
+        # Validate operations
+        operations = _validate_expert_operations(operations, "basic")
+        
+        # 🧹 Clean up tensors
+        safe_tensor_delete({'inputs': inputs, 'outputs': outputs, 'generated_tokens': generated_tokens})
+
+        print("=" * 50)
+        print("📊 EXPERT BASIC ANALYSIS COMPLETED")
+        print(f"✅ VALIDATED OPERATIONS: {operations}")
+        print(f"⏱️ Generation time: {elapsed} seconds\n")
+
+        return jsonify({
+            "success": True,
+            "generation_time": elapsed,
+            "steps": operations,
+            "ai_response_raw": ai_response[:300],
+            "model_used": MODEL_NAME,
+            "analysis_type": "basic",
+            "memory_managed": True,
+            "reasoning_level": "principal_data_analyst"
+        }), 200
+
+    except Exception as e:
+        cleanup_memory()
+        raise e
+
+def _analyze_column_wise(summary, start_time):
+    """Column-wise analysis with data platform architect reasoning"""
+    try:
+        prompt = _create_expert_prompt(summary, "column_wise")
+        
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(model.device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=200,
+                temperature=0.1,  # Very deterministic for column-wise decisions
+                top_p=0.85,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+                repetition_penalty=1.05,
+                num_return_sequences=1
+            )
+
+        generated_tokens = outputs[0][inputs['input_ids'].shape[1]:]
+        ai_response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+        print("✅ AI model responded with architect-level reasoning!")
+        column_operations = extract_column_operations_from_response(ai_response)
+        elapsed = round(time.time() - start_time, 2)
+
+        # Validate column operations
+        column_operations = _validate_column_operations(column_operations)
+        
+        # 🧹 Clean up tensors
+        safe_tensor_delete({'inputs': inputs, 'outputs': outputs, 'generated_tokens': generated_tokens})
+
+        print("=" * 60)
+        print("📊 ARCHITECT-LEVEL COLUMN ANALYSIS COMPLETED")
+        for column, operations in column_operations.items():
+            if column == "dataset_wide":
+                print(f"🌐 DATASET-WIDE: {operations}")
+            else:
+                print(f"  📍 {column}: {operations}")
+        print(f"⏱️ Generation time: {elapsed} seconds\n")
+
+        return jsonify({
+            "success": True,
+            "generation_time": elapsed,
+            "column_operations": column_operations,
+            "steps": _flatten_operations(column_operations),
+            "ai_response_raw": ai_response[:280],
+            "model_used": MODEL_NAME,
+            "analysis_type": "column_wise",
+            "memory_managed": True,
+            "reasoning_level": "data_platform_architect"
+        }), 200
+
+    except Exception as e:
+        cleanup_memory()
+        raise e
+
+# -------------------------------------------------------------
+# ✅ Test endpoints with enhanced expert prompts
+# -------------------------------------------------------------
+@app.route("/test_fast", methods=["GET"])
+def test_fast():
+    """Test fast analysis with expert reasoning"""
+    if model is None:
+        return jsonify({"error": "Model not loaded"}), 500
+
+    try:
+        # Enhanced test prompt with expert reasoning
+        test_summary = """Dataset: Customer Transactions (10,000 rows)
+Columns:
+1. TransactionID (unique string) - Primary key
+2. CustomerID (string) - Foreign key to customers table
+3. TransactionDate (string in MM/DD/YYYY format)
+4. ProductCategory (categorical: Electronics, Clothing, Home, Books) - 5% missing
+5. Amount (numeric, range $1-$5000, right-skewed) - 2% missing
+6. Quantity (integer, 1-100)
+7. PaymentMethod (categorical: Credit Card, Debit Card, PayPal, Cash)
+8. IsFraud (binary: 0/1) - Target variable
+9. CustomerRegion (categorical: 15 regions)
+10. TransactionHour (integer 0-23)"""
+
+        prompt = _create_expert_prompt(test_summary, "fast")
+
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=80,
+                temperature=0.1,  # Deterministic for testing
+                do_sample=True
+            )
+
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        # Extract and validate operations
+        operations = extract_operations_from_response(response)
+        validated_ops = _validate_expert_operations(operations, "fast")
+        
+        # Clean up
+        safe_tensor_delete({'inputs': inputs, 'outputs': outputs})
+        
+        return jsonify({
+            "test_response": response,
+            "validated_operations": validated_ops,
+            "model_status": "working",
+            "analysis_type": "expert_fast",
+            "memory_managed": True,
+            "reasoning_level": "senior_data_analyst",
+            "operation_catalog": "full_63_operations"
+        })
+
+    except Exception as e:
+        cleanup_memory()
+        return jsonify({"error": str(e)}), 500
+
+# -------------------------------------------------------------
+# ✅ Run Flask Server
+# -------------------------------------------------------------
+if __name__ == "__main__":
+    print("🔥 Starting ENHANCED Mistral Flask API on http://127.0.0.1:5005")
+    print("💡 FULL DATA ANALYST OPERATIONS ENABLED (63 operations)")
+    print("🧹 MEMORY MANAGEMENT: Active (no memory leaks)")
+    print("🎯 EXPERT REASONING: Senior Data Analyst → Principal → Platform Architect")
+    print("📚 Available endpoints:")
+    print("   GET  /health        - Check server status")
+    print("   POST /analyze       - Dataset analysis (fast/basic/column_wise)")
+    print("   GET  /test_fast     - Test fast analysis with expert reasoning")
+    app.run(host="127.0.0.1", port=5005, debug=False, threaded=True)
