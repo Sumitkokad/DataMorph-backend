@@ -75,6 +75,7 @@ CORS_ALLOW_ALL_ORIGINS = True
 
 CSRF_TRUSTED_ORIGINS = [
     "https://datamorphe.netlify.app",
+    "https://datamorphfrontend.netlify.app",
     "http://localhost:3000",
     "https://*.pythonanywhere.com",
 ]
