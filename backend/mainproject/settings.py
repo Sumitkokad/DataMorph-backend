@@ -73,9 +73,12 @@ MIDDLEWARE = [
 
 CORS_ALLOW_ALL_ORIGINS = True
 
+CORS_EXPOSE_HEADERS = ["Content-Type", "Content-Disposition"]
+
 CSRF_TRUSTED_ORIGINS = [
-    "https://datamorphe.netlify.app",
+    "https://datamorphfrontend.netlify.app",
     "http://localhost:3000",
+    "http://localhost:5173",
     "https://*.pythonanywhere.com",
 ]
 
@@ -153,11 +156,6 @@ USE_I18N = True
 
 USE_TZ = True
 
-
-# Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/5.2/howto/static-files/
-
-STATIC_URL = 'static/'
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field

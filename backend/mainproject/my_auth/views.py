@@ -352,8 +352,8 @@ class PasswordResetEmailView(APIView):
             uid = urlsafe_base64_encode(force_bytes(user.pk))
             token = default_token_generator.make_token(user)
             
-            # Frontend URL - adjust if your frontend runs on a different port
-            frontend_url = 'http://localhost:5173'
+            # Frontend URL - configurable via env var for production
+            frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:5173')
             reset_url = f"{frontend_url}/reset-password/{uid}/{token}"
             
             subject = 'Password Reset Request - BisMit Co'
