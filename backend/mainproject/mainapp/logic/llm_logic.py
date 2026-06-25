@@ -16,7 +16,7 @@ class LLMAgent:
         import os
         
         # Groq API Configuration
-        self.api_key = "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"
+        self.api_key = "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"
         
         if not self.api_key:
             raise ValueError("❌ GROQ_API_KEY not set")
